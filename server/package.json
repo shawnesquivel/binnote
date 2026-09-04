@@ -1,0 +1,17 @@
+{
+  "name": "binnote-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "multer": "^2.3.0",
+    "nanoid": "^5.1.5",
+    "open": "^10.1.0"
+  }
+}
