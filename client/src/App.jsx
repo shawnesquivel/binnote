@@ -17,19 +17,22 @@ turndown.addRule("images", {
   replacement(_content, node) {
     const alt = node.getAttribute("alt") || "";
     const src = node.getAttribute("src") || "";
-    // Prefer relative media paths when we stored them as data-relative
     const relative = node.getAttribute("data-relative");
     return `![${alt}](${relative || src})`;
   },
 });
 
 function markdownToHtml(markdown) {
-  const html = marked.parse(markdown || "", { async: false });
-  // Rewrite relative media/ paths to server URLs for display
-  return html.replace(
-    /src="(media\/[^"]+)"/g,
-    (_m, rel) => `src="/${rel}" data-relative="${rel}"`
-  );
+  const html = String(marked.parse(markdown || "", { async: false }));
+  return html
+    .replace(
+      /src="(media\/[^"]+)"/g,
+      (_m, rel) => `src="/${rel}" data-relative="${rel}"`
+    )
+    .replace(/src="(\/media\/[^"]+)"/g, (_m, src) => {
+      const rel = src.slice(1);
+      return `src="${src}" data-relative="${rel}"`;
+    });
 }
 
 function htmlToMarkdown(html) {
@@ -45,15 +48,39 @@ async function api(path, options = {}) {
   return res.json();
 }
 
+const LocalImage = Image.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      "data-relative": {
+        default: null,
+        parseHTML: (element) => element.getAttribute("data-relative"),
+        renderHTML: (attributes) => {
+          if (!attributes["data-relative"]) return {};
+          return { "data-relative": attributes["data-relative"] };
+        },
+      },
+    };
+  },
+}).configure({
+  inline: false,
+  allowBase64: false,
+  HTMLAttributes: { class: "note-image" },
+});
+
 export default function App() {
   const [notes, setNotes] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [status, setStatus] = useState("Loading…");
   const [mediaPath, setMediaPath] = useState("");
   const [bootError, setBootError] = useState("");
+
   const saveTimer = useRef(null);
   const activeIdRef = useRef(null);
   const uploading = useRef(false);
+  const loadGen = useRef(0);
+  const pendingMarkdown = useRef(null);
+  const editorRef = useRef(null);
 
   useEffect(() => {
     activeIdRef.current = activeId;
@@ -84,13 +111,13 @@ export default function App() {
   }, []);
 
   const scheduleSave = useCallback(
-    (editor) => {
+    (ed) => {
       const id = activeIdRef.current;
-      if (!id || !editor) return;
+      if (!id || !ed) return;
       clearTimeout(saveTimer.current);
       setStatus("Editing…");
       saveTimer.current = setTimeout(() => {
-        const md = htmlToMarkdown(editor.getHTML());
+        const md = htmlToMarkdown(ed.getHTML());
         saveNote(id, md).catch((err) => setStatus(err.message));
       }, 500);
     },
@@ -102,35 +129,38 @@ export default function App() {
     if (!id || !file) return null;
     const form = new FormData();
     form.append("image", file, file.name || "paste.png");
-    const result = await api(`/api/notes/${id}/images`, {
-      method: "POST",
-      body: form,
-    });
-    return result;
+    return api(`/api/notes/${id}/images`, { method: "POST", body: form });
   }, []);
+
+  const applyMarkdown = useCallback((markdown) => {
+    const ed = editorRef.current;
+    if (!ed) {
+      pendingMarkdown.current = markdown;
+      return;
+    }
+    pendingMarkdown.current = null;
+    ed.commands.setContent(markdownToHtml(markdown), false);
+  }, []);
+
+  const loadNote = useCallback(
+    async (id) => {
+      clearTimeout(saveTimer.current);
+      const gen = ++loadGen.current;
+      setActiveId(id);
+      setStatus("Loading…");
+      const note = await api(`/api/notes/${id}`);
+      if (gen !== loadGen.current) return;
+      applyMarkdown(note.content);
+      setStatus("Ready");
+      return note;
+    },
+    [applyMarkdown]
+  );
 
   const editor = useEditor({
     extensions: [
       StarterKit,
-      Image.configure({
-        inline: false,
-        allowBase64: false,
-        HTMLAttributes: { class: "note-image" },
-      }).extend({
-        addAttributes() {
-          return {
-            ...this.parent?.(),
-            "data-relative": {
-              default: null,
-              parseHTML: (element) => element.getAttribute("data-relative"),
-              renderHTML: (attributes) => {
-                if (!attributes["data-relative"]) return {};
-                return { "data-relative": attributes["data-relative"] };
-              },
-            },
-          };
-        },
-      }),
+      LocalImage,
       Placeholder.configure({
         placeholder: "Start typing… paste an image anytime",
       }),
@@ -158,13 +188,14 @@ export default function App() {
               if (!file) continue;
               const result = await uploadImage(file);
               if (!result) continue;
-              const { state, dispatch } = view;
-              const node = state.schema.nodes.image.create({
+              const node = view.state.schema.nodes.image.create({
                 src: result.url,
                 alt: "",
                 "data-relative": result.relative,
               });
-              dispatch(state.tr.replaceSelectionWith(node).scrollIntoView());
+              view.dispatch(
+                view.state.tr.replaceSelectionWith(node).scrollIntoView()
+              );
             }
             setStatus("Image saved to media bin");
           } catch (err) {
@@ -199,8 +230,7 @@ export default function App() {
                 alt: file.name,
                 "data-relative": result.relative,
               });
-              const tr = view.state.tr.insert(pos, node);
-              view.dispatch(tr);
+              view.dispatch(view.state.tr.insert(pos, node));
               pos += node.nodeSize;
             }
             setStatus("Image saved to media bin");
@@ -216,28 +246,25 @@ export default function App() {
     onUpdate: ({ editor: ed }) => scheduleSave(ed),
   });
 
-  const loadNote = useCallback(
-    async (id) => {
-      clearTimeout(saveTimer.current);
-      const note = await api(`/api/notes/${id}`);
-      setActiveId(id);
-      editor?.commands.setContent(markdownToHtml(note.content), false);
-      setStatus("Ready");
-    },
-    [editor]
-  );
+  useEffect(() => {
+    editorRef.current = editor;
+    if (!editor || pendingMarkdown.current == null) return;
+    const md = pendingMarkdown.current;
+    pendingMarkdown.current = null;
+    editor.commands.setContent(markdownToHtml(md), false);
+  }, [editor]);
 
   useEffect(() => {
     (async () => {
       try {
-        let list = await refreshNotes();
+        const list = await refreshNotes();
         if (!list.length) {
           const created = await api("/api/notes", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ title: "Untitled" }),
           });
-          list = await refreshNotes();
+          await refreshNotes();
           await loadNote(created.id);
         } else {
           await loadNote(list[0].id);
@@ -253,14 +280,19 @@ export default function App() {
   }, []);
 
   async function createNote() {
-    const created = await api("/api/notes", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "Untitled" }),
-    });
-    await refreshNotes();
-    await loadNote(created.id);
-    editor?.commands.focus("end");
+    try {
+      setStatus("Creating…");
+      const created = await api("/api/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Untitled" }),
+      });
+      await refreshNotes();
+      await loadNote(created.id);
+      requestAnimationFrame(() => editorRef.current?.commands.focus("end"));
+    } catch (err) {
+      setStatus(err.message || "Could not create note");
+    }
   }
 
   async function deleteNote(id) {
@@ -271,7 +303,7 @@ export default function App() {
       if (list[0]) await loadNote(list[0].id);
       else {
         setActiveId(null);
-        editor?.commands.clearContent();
+        editorRef.current?.commands.clearContent();
       }
     }
   }
